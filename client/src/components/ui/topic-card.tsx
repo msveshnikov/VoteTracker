@@ -16,7 +16,20 @@ interface TopicCardProps {
 }
 
 export function TopicCard({ topic, showFullContent = false }: TopicCardProps) {
-  const { options = [], category, voteCount = 0, userVote } = topic;
+  // Ensure options has proper type with voteCount and percentage
+  const { category, voteCount = 0, userVote } = topic;
+  const options = (topic.options || []).map(option => {
+    // If option doesn't have percentage or voteCount properties, add defaults
+    if (!('percentage' in option) || !('voteCount' in option)) {
+      return {
+        ...option,
+        voteCount: 'voteCount' in option ? option.voteCount : 0,
+        percentage: 'percentage' in option ? option.percentage : 0
+      } as OptionWithVoteCount;
+    }
+    return option as OptionWithVoteCount;
+  });
+  
   const [selectedOption, setSelectedOption] = useState<number | null>(
     userVote ? userVote.optionId : null
   );
@@ -44,10 +57,22 @@ export function TopicCard({ topic, showFullContent = false }: TopicCardProps) {
     
     try {
       setIsVoting(true);
-      await apiRequest("POST", "/api/vote", {
+      const response = await apiRequest("POST", "/api/vote", {
         optionId: selectedOption,
         topicId: topic.id
       });
+      
+      // Get updated stats from response
+      const data = await response.json();
+      
+      // Update local state with new stats
+      if (data.stats && Array.isArray(data.stats)) {
+        // Find option with current selection and update its percentage
+        const updatedOption = data.stats.find((opt: OptionWithVoteCount) => opt.id === selectedOption);
+        if (updatedOption) {
+          setSelectedOption(updatedOption.id);
+        }
+      }
       
       // Invalidate topic cache to reload data
       queryClient.invalidateQueries({ queryKey: [`/api/topics/${topic.id}`] });
@@ -102,7 +127,7 @@ export function TopicCard({ topic, showFullContent = false }: TopicCardProps) {
         
         <div className="mb-6">
           <div className="space-y-4">
-            {options.map((option: OptionWithVoteCount) => (
+            {options.map((option) => (
               <VoteOption
                 key={option.id}
                 text={option.text}

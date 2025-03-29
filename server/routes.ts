@@ -161,9 +161,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Option does not belong to this topic" });
       }
 
+      // Make sure we have a valid user ID
+      if (!req.user || !req.user.id) {
+        return res.status(401).json({ message: "User session is invalid" });
+      }
+
       // Create the vote with the user ID from the session
       const vote = await storage.createVote({
-        userId: req.user!.id,
+        userId: req.user.id,
         optionId,
         topicId
       });
@@ -173,6 +178,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.status(201).json({ vote, stats: updatedStats });
     } catch (error) {
+      console.error("Vote error:", error);
       res.status(500).json({ message: "Failed to cast vote" });
     }
   });
