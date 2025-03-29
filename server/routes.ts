@@ -136,31 +136,40 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
 
     try {
-      const validation = insertVoteSchema.safeParse(req.body);
-      if (!validation.success) {
-        return res.status(400).json({ message: "Invalid vote data", errors: validation.error.format() });
+      // Create a client-side vote schema that doesn't require userId
+      const clientVoteSchema = z.object({
+        optionId: z.number(),
+        topicId: z.number()
+      });
+      
+      // Validate the client input
+      const clientValidation = clientVoteSchema.safeParse(req.body);
+      if (!clientValidation.success) {
+        return res.status(400).json({ message: "Invalid vote data", errors: clientValidation.error.format() });
       }
+      
+      const { optionId, topicId } = clientValidation.data;
 
       // Check if option belongs to topic
-      const topic = await storage.getTopic(validation.data.topicId);
+      const topic = await storage.getTopic(topicId);
       if (!topic) {
         return res.status(404).json({ message: "Topic not found" });
       }
 
-      const optionBelongsToTopic = topic.options.some(o => o.id === validation.data.optionId);
+      const optionBelongsToTopic = topic.options.some(o => o.id === optionId);
       if (!optionBelongsToTopic) {
         return res.status(400).json({ message: "Option does not belong to this topic" });
       }
 
-      // Create the vote
+      // Create the vote with the user ID from the session
       const vote = await storage.createVote({
         userId: req.user!.id,
-        optionId: validation.data.optionId,
-        topicId: validation.data.topicId
+        optionId,
+        topicId
       });
 
       // Get updated stats
-      const updatedStats = await storage.getTopicStats(validation.data.topicId);
+      const updatedStats = await storage.getTopicStats(topicId);
 
       res.status(201).json({ vote, stats: updatedStats });
     } catch (error) {
