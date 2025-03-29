@@ -275,15 +275,17 @@ export class DatabaseStorage implements IStorage {
       .where(eq(options.topicId, topic.id));
     
     // Count total votes for this topic
-    const [{ count }] = await db
-      .select({ count: count() })
+    const result = await db
+      .select({ voteCount: count() })
       .from(votes)
       .where(eq(votes.topicId, topic.id));
+    
+    const voteCount = result.length > 0 ? Number(result[0].voteCount) : 0;
     
     return {
       ...topic,
       options: topicOptions,
-      voteCount: Number(count) || 0
+      voteCount
     };
   }
   
@@ -326,4 +328,4 @@ export class DatabaseStorage implements IStorage {
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();

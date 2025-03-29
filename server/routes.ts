@@ -8,6 +8,11 @@ import { z } from "zod";
 export async function registerRoutes(app: Express): Promise<Server> {
   // Set up authentication routes
   setupAuth(app);
+  
+  // Seed the database with default categories if needed
+  if ('seedCategoriesIfNeeded' in storage) {
+    await (storage as any).seedCategoriesIfNeeded();
+  }
 
   // Get all categories
   app.get("/api/categories", async (req, res) => {
@@ -156,7 +161,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "Topic not found" });
       }
 
-      const optionBelongsToTopic = topic.options.some(o => o.id === optionId);
+      const optionBelongsToTopic = topic.options.some((o: any) => o.id === optionId);
       if (!optionBelongsToTopic) {
         return res.status(400).json({ message: "Option does not belong to this topic" });
       }
