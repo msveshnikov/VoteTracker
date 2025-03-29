@@ -7,8 +7,12 @@ import {
 } from "@shared/schema";
 import session from "express-session";
 import createMemoryStore from "memorystore";
+import connectPg from "connect-pg-simple";
+import { pool, db } from "./db";
+import { eq, and, like, sql, desc, count } from "drizzle-orm";
 
 const MemoryStore = createMemoryStore(session);
+const PostgresSessionStore = connectPg(session);
 
 export interface IStorage {
   // User operations
@@ -35,94 +39,82 @@ export interface IStorage {
   getTopicStats(topicId: number): Promise<OptionWithVoteCount[]>;
   
   // Session store
-  sessionStore: session.SessionStore;
+  sessionStore: session.Store;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<number, User>;
-  private categories: Map<number, Category>;
-  private topics: Map<number, Topic>;
-  private options: Map<number, Option>;
-  private votes: Map<number, Vote>;
-  
-  sessionStore: session.SessionStore;
-  
-  currentUserId: number;
-  currentCategoryId: number;
-  currentTopicId: number;
-  currentOptionId: number;
-  currentVoteId: number;
+export class DatabaseStorage implements IStorage {
+  sessionStore: session.Store;
 
   constructor() {
-    this.users = new Map();
-    this.categories = new Map();
-    this.topics = new Map();
-    this.options = new Map();
-    this.votes = new Map();
-    
-    this.currentUserId = 1;
-    this.currentCategoryId = 1;
-    this.currentTopicId = 1;
-    this.currentOptionId = 1;
-    this.currentVoteId = 1;
-    
-    this.sessionStore = new MemoryStore({
-      checkPeriod: 86400000 // 24h
+    this.sessionStore = new PostgresSessionStore({
+      pool,
+      createTableIfMissing: true
     });
-    
-    // Seed categories
-    this.seedCategories();
   }
   
   // User operations
   async getUser(id: number): Promise<User | undefined> {
-    return this.users.get(id);
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username.toLowerCase() === username.toLowerCase(),
-    );
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.username, username));
+    return user;
   }
   
   async getUserByEmail(email: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.email.toLowerCase() === email.toLowerCase(),
-    );
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, email));
+    return user;
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const id = this.currentUserId++;
-    const now = new Date();
-    const user: User = { ...insertUser, id, createdAt: now };
-    this.users.set(id, user);
+    const [user] = await db
+      .insert(users)
+      .values(insertUser)
+      .returning();
     return user;
   }
   
   // Category operations
   async getCategories(): Promise<Category[]> {
-    return Array.from(this.categories.values());
+    return db.select().from(categories);
   }
   
   async getCategory(id: number): Promise<Category | undefined> {
-    return this.categories.get(id);
+    const [category] = await db
+      .select()
+      .from(categories)
+      .where(eq(categories.id, id));
+    return category;
   }
   
   async createCategory(category: InsertCategory): Promise<Category> {
-    const id = this.currentCategoryId++;
-    const newCategory: Category = { ...category, id };
-    this.categories.set(id, newCategory);
+    const [newCategory] = await db
+      .insert(categories)
+      .values(category)
+      .returning();
     return newCategory;
   }
   
   // Topic operations
   async getTopics(): Promise<TopicWithCategoryAndOptions[]> {
-    const allTopics = Array.from(this.topics.values());
+    const allTopics = await db.select().from(topics);
     return Promise.all(allTopics.map(topic => this.enrichTopicWithCategoryAndOptions(topic)));
   }
   
   async getTopic(id: number): Promise<TopicWithCategoryAndOptionsAndVotes | undefined> {
-    const topic = this.topics.get(id);
+    const [topic] = await db
+      .select()
+      .from(topics)
+      .where(eq(topics.id, id));
+    
     if (!topic) return undefined;
     
     const enrichedTopic = await this.enrichTopicWithCategoryAndOptions(topic);
@@ -133,42 +125,55 @@ export class MemStorage implements IStorage {
   }
   
   async getTopicsByCategory(categoryId: number): Promise<TopicWithCategoryAndOptions[]> {
-    const topicsInCategory = Array.from(this.topics.values())
-      .filter(topic => topic.categoryId === categoryId);
+    const topicsInCategory = await db
+      .select()
+      .from(topics)
+      .where(eq(topics.categoryId, categoryId));
     
     return Promise.all(topicsInCategory.map(topic => this.enrichTopicWithCategoryAndOptions(topic)));
   }
   
   async createTopic(topic: InsertTopic, optionTexts: string[]): Promise<TopicWithOptions> {
-    const id = this.currentTopicId++;
-    const now = new Date();
-    const newTopic: Topic = { ...topic, id, createdAt: now, active: true };
-    this.topics.set(id, newTopic);
+    // Start a transaction
+    const [newTopic] = await db.transaction(async (tx) => {
+      // Create the topic
+      const [createdTopic] = await tx
+        .insert(topics)
+        .values({ ...topic, active: true })
+        .returning();
+      
+      // Create options for the topic
+      const optionsToInsert = optionTexts
+        .filter(text => text.trim())
+        .map(text => ({ text, topicId: createdTopic.id }));
+      
+      // Insert all options
+      await tx.insert(options).values(optionsToInsert);
+      
+      return [createdTopic];
+    });
     
-    // Create options for the topic
-    const createdOptions: Option[] = [];
-    for (const text of optionTexts) {
-      if (text.trim()) {
-        const optionId = this.currentOptionId++;
-        const option: Option = { id: optionId, text, topicId: id };
-        this.options.set(optionId, option);
-        createdOptions.push(option);
-      }
-    }
+    // Get the options that were just created
+    const topicOptions = await db
+      .select()
+      .from(options)
+      .where(eq(options.topicId, newTopic.id));
     
     return {
       ...newTopic,
-      options: createdOptions,
+      options: topicOptions,
       voteCount: 0
     };
   }
   
   async searchTopics(query: string): Promise<TopicWithCategoryAndOptions[]> {
-    const normalizedQuery = query.toLowerCase();
-    const matchingTopics = Array.from(this.topics.values())
-      .filter(topic => 
-        topic.title.toLowerCase().includes(normalizedQuery) || 
-        (topic.description && topic.description.toLowerCase().includes(normalizedQuery))
+    const searchPattern = `%${query}%`;
+    
+    const matchingTopics = await db
+      .select()
+      .from(topics)
+      .where(
+        sql`${topics.title} ILIKE ${searchPattern} OR ${topics.description} ILIKE ${searchPattern}`
       );
     
     return Promise.all(matchingTopics.map(topic => this.enrichTopicWithCategoryAndOptions(topic)));
@@ -176,43 +181,84 @@ export class MemStorage implements IStorage {
   
   // Vote operations
   async getVote(userId: number, topicId: number): Promise<Vote | undefined> {
-    return Array.from(this.votes.values()).find(
-      vote => vote.userId === userId && vote.topicId === topicId
-    );
+    const [vote] = await db
+      .select()
+      .from(votes)
+      .where(
+        and(
+          eq(votes.userId, userId),
+          eq(votes.topicId, topicId)
+        )
+      );
+    return vote;
   }
   
   async createVote(vote: InsertVote): Promise<Vote> {
-    // Check if user already voted on this topic
-    const existingVote = await this.getVote(vote.userId, vote.topicId);
-    
-    if (existingVote) {
-      // Remove existing vote
-      this.votes.delete(existingVote.id);
-    }
-    
-    const id = this.currentVoteId++;
-    const now = new Date();
-    const newVote: Vote = { ...vote, id, createdAt: now };
-    this.votes.set(id, newVote);
-    return newVote;
+    // Start a transaction
+    return db.transaction(async (tx) => {
+      // Check if user already voted on this topic
+      const [existingVote] = await tx
+        .select()
+        .from(votes)
+        .where(
+          and(
+            eq(votes.userId, vote.userId),
+            eq(votes.topicId, vote.topicId)
+          )
+        );
+      
+      if (existingVote) {
+        // If the user is voting for the same option, return the existing vote
+        if (existingVote.optionId === vote.optionId) {
+          return existingVote;
+        }
+        
+        // Otherwise, delete the existing vote
+        await tx
+          .delete(votes)
+          .where(eq(votes.id, existingVote.id));
+      }
+      
+      // Create the new vote
+      const [newVote] = await tx
+        .insert(votes)
+        .values(vote)
+        .returning();
+      
+      return newVote;
+    });
   }
   
   async getTopicStats(topicId: number): Promise<OptionWithVoteCount[]> {
-    const topicOptions = Array.from(this.options.values())
-      .filter(option => option.topicId === topicId);
+    // Get all options for the topic
+    const topicOptions = await db
+      .select()
+      .from(options)
+      .where(eq(options.topicId, topicId));
     
-    const topicVotes = Array.from(this.votes.values())
-      .filter(vote => vote.topicId === topicId);
+    // Count votes per option
+    const voteCountsQuery = db
+      .select({
+        optionId: votes.optionId,
+        count: count(),
+      })
+      .from(votes)
+      .where(eq(votes.topicId, topicId))
+      .groupBy(votes.optionId);
     
-    const totalVotes = topicVotes.length;
+    const voteCounts = await voteCountsQuery;
     
+    // Total votes for this topic
+    const totalVotes = voteCounts.reduce((sum, { count }) => sum + Number(count), 0);
+    
+    // Create the stats object
     const optionsWithStats: OptionWithVoteCount[] = topicOptions.map(option => {
-      const voteCount = topicVotes.filter(vote => vote.optionId === option.id).length;
-      const percentage = totalVotes > 0 ? Math.round((voteCount / totalVotes) * 100) : 0;
+      const voteCount = voteCounts.find(vc => vc.optionId === option.id)?.count || 0;
+      const percentage = totalVotes > 0 ? Math.round((Number(voteCount) / totalVotes) * 100) : 0;
       
       return {
         ...option,
-        voteCount,
+        voteCount: Number(voteCount),
         percentage
       };
     });
@@ -222,45 +268,61 @@ export class MemStorage implements IStorage {
   
   // Helper methods
   private async enrichTopicWithOptions(topic: Topic): Promise<TopicWithOptions> {
-    const topicOptions = Array.from(this.options.values())
-      .filter(option => option.topicId === topic.id);
+    // Get options for this topic
+    const topicOptions = await db
+      .select()
+      .from(options)
+      .where(eq(options.topicId, topic.id));
     
-    const voteCount = Array.from(this.votes.values())
-      .filter(vote => vote.topicId === topic.id).length;
+    // Count total votes for this topic
+    const [{ count }] = await db
+      .select({ count: count() })
+      .from(votes)
+      .where(eq(votes.topicId, topic.id));
     
     return {
       ...topic,
       options: topicOptions,
-      voteCount
+      voteCount: Number(count) || 0
     };
   }
   
   private async enrichTopicWithCategoryAndOptions(topic: Topic): Promise<TopicWithCategoryAndOptions> {
     const topicWithOptions = await this.enrichTopicWithOptions(topic);
-    const category = await this.getCategory(topic.categoryId || 0);
+    
+    let category: Category | undefined;
+    
+    if (topic.categoryId) {
+      [category] = await db
+        .select()
+        .from(categories)
+        .where(eq(categories.id, topic.categoryId));
+    }
     
     return {
       ...topicWithOptions,
-      category: category || { id: 0, name: 'Uncategorized' }
+      category: category || { id: 0, name: 'Uncategorized', description: null, icon: null }
     };
   }
-  
-  private seedCategories() {
-    const defaultCategories: InsertCategory[] = [
-      { name: 'Politics', description: 'Political discussions and polls', icon: 'buildings' },
-      { name: 'Technology', description: 'Tech innovations and digital trends', icon: 'laptop' },
-      { name: 'Environment', description: 'Climate and environmental issues', icon: 'globe' },
-      { name: 'Health', description: 'Healthcare and wellness topics', icon: 'activity' },
-      { name: 'Education', description: 'Learning and educational reforms', icon: 'graduation-cap' },
-      { name: 'Economy', description: 'Economic policies and financial matters', icon: 'dollar-sign' },
-      { name: 'Society', description: 'Social issues and community concerns', icon: 'users' },
-      { name: 'Culture', description: 'Arts, entertainment and cultural topics', icon: 'palette' }
-    ];
+
+  // Seed the database with default categories if none exist
+  async seedCategoriesIfNeeded() {
+    const existingCategories = await db.select().from(categories);
     
-    defaultCategories.forEach(category => {
-      const id = this.currentCategoryId++;
-      this.categories.set(id, { ...category, id });
-    });
+    if (existingCategories.length === 0) {
+      const defaultCategories: InsertCategory[] = [
+        { name: 'Politics', description: 'Political discussions and polls', icon: 'buildings' },
+        { name: 'Technology', description: 'Tech innovations and digital trends', icon: 'laptop' },
+        { name: 'Environment', description: 'Climate and environmental issues', icon: 'globe' },
+        { name: 'Health', description: 'Healthcare and wellness topics', icon: 'activity' },
+        { name: 'Education', description: 'Learning and educational reforms', icon: 'graduation-cap' },
+        { name: 'Economy', description: 'Economic policies and financial matters', icon: 'dollar-sign' },
+        { name: 'Society', description: 'Social issues and community concerns', icon: 'users' },
+        { name: 'Culture', description: 'Arts, entertainment and cultural topics', icon: 'palette' }
+      ];
+      
+      await db.insert(categories).values(defaultCategories);
+    }
   }
 }
 
